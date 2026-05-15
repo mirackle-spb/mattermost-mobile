@@ -196,7 +196,17 @@ async function configureTestServer(token) {
     config.RateLimitSettings = config.RateLimitSettings || {};
     config.RateLimitSettings.Enable = false;
 
-    console.log('[provision] Updating plugin uploads, Marketplace, and disabling rate limiting...');
+    // Bump the maximum active users limit so parallel test shards never hit
+    // "user_limits_exceeded" / ERROR_SAFETY_LIMITS_EXCEEDED. Each test file
+    // calls apiInit() → apiCreateUser(), and with 20 shards × ~6 test files
+    // per run (~120 users/run), accumulated users from repeated CI runs on
+    // the same provisioned server can exhaust the default trial-license limit.
+    config.ServiceSettings = config.ServiceSettings || {};
+    config.ServiceSettings.MaximumActiveUsers = 999999; // effectively unlimited
+    config.TeamSettings = config.TeamSettings || {};
+    config.TeamSettings.MaxUsersPerTeam = 999999;
+
+    console.log('[provision] Updating plugin uploads, Marketplace, disabling rate limiting, and removing user caps...');
     const updateRes = await request('PUT', '/api/v4/config', config, token);
     if (updateRes.status >= 400) {
         console.warn(`[provision] Config update failed (HTTP ${updateRes.status}): ${updateRes.data.message || JSON.stringify(updateRes.data)}`);
@@ -265,10 +275,59 @@ async function installPlugin(token, {id: pluginId, url: pluginUrl}) {
     }
 }
 
+async function cleanupUsers(token) {
+    /* eslint-disable no-await-in-loop */
+    console.log('[provision] Cleaning up stale test users from previous runs...');
+
+    // Fetch users in batches. Test users have a "user-" prefix in their username.
+    let page = 0;
+    const perPage = 200;
+    let deletedCount = 0;
+
+    while (true) {
+        const res = await request(
+            'GET',
+            `/api/v4/users?page=${page}&per_page=${perPage}&inactive=true&without_team=true`,
+            null,
+            token,
+        );
+
+        if (res.status >= 400 || !Array.isArray(res.data) || res.data.length === 0) {
+            break;
+        }
+
+        const testUsers = res.data.filter(
+            (u) => u.username && u.username.startsWith('user-'),
+        );
+
+        for (const user of testUsers) {
+            const deleteRes = await request(
+                'DELETE',
+                `/api/v4/users/${user.id}?permanent=true`,
+                null,
+                token,
+            );
+            if (deleteRes.status < 400) {
+                deletedCount++;
+            }
+        }
+
+        page++;
+    }
+
+    if (deletedCount > 0) {
+        console.log(`[provision] Deleted ${deletedCount} stale test users.`);
+    } else {
+        console.log('[provision] No stale test users to clean up.');
+    }
+    /* eslint-enable no-await-in-loop */
+}
+
 async function main() {
     const token = await login();
     await ensureTrialLicense(token);
     await configureTestServer(token);
+    await cleanupUsers(token);
 
     for (const plugin of REQUIRED_PLUGINS) {
         await installPlugin(token, plugin); // eslint-disable-line no-await-in-loop
